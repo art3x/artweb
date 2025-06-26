@@ -1,4 +1,5 @@
-﻿#include "httplib.h"  // Download from https://github.com/yhirose/cpp-httplib
+﻿#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"  // Download from https://github.com/yhirose/cpp-httplib
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -9,6 +10,8 @@
 #include <iomanip>
 #include <cctype>
 #include <clocale>    // For setlocale
+#include <memory>     // For std::unique_ptr
+#include <map>        // For MIME types
 
 #if __has_include(<filesystem>)
 #include <filesystem>
@@ -36,10 +39,39 @@ namespace fs = std::experimental::filesystem;
 #endif
 
 // --- Version number ---
-const std::string VERSION = "v1.1";
+const std::string VERSION = "v2.0";
 
 // --- Maximum allowed file upload size (1 GB) ---
 const std::size_t MAX_UPLOAD_SIZE = 1024 * 1024 * 1024;
+
+
+std::string get_mime_type(const std::string& path) {
+    auto pos = path.rfind('.');
+    if (pos == std::string::npos) {
+        return "application/octet-stream";
+    }
+    auto ext = path.substr(pos);
+    static const std::map<std::string, std::string> mime_map = {
+        {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"},
+        {".js", "application/javascript"}, {".json", "application/json"},
+        {".xml", "application/xml"}, {".txt", "text/plain"}, {".jpg", "image/jpeg"},
+        {".jpeg", "image/jpeg"}, {".png", "image/png"}, {".gif", "image/gif"},
+        {".svg", "image/svg+xml"}, {".ico", "image/x-icon"}, {".woff", "font/woff"},
+        {".woff2", "font/woff2"}, {".ttf", "font/ttf"}, {".mp4", "video/mp4"},
+        {".webm", "video/webm"}, {".mp3", "audio/mpeg"}, {".ogg", "audio/ogg"},
+        {".wav", "audio/wav"}, {".pdf", "application/pdf"}, {".zip", "application/zip"},
+    };
+    auto it = mime_map.find(ext);
+    if (it != mime_map.end()) {
+        return it->second;
+    }
+    return "application/octet-stream";
+}
+
+// Global variables for configuration
+bool require_auth = false;
+std::string g_expected_auth_header;
+std::string g_web_root_path; // Path to the web root directory
 
 // --- Base64 encoding (for HTTP Basic Auth) ---
 static const std::string base64_chars =
@@ -65,12 +97,11 @@ std::string base64_encode(const std::string& in) {
     return out;
 }
 
-// --- URL encode helper function (unused in logs) ---
+// --- URL encode helper function ---
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
     escaped.fill('0');
     escaped << std::hex;
-
     for (unsigned char c : value) {
         if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
             escaped << c;
@@ -94,27 +125,29 @@ std::wstring utf8_to_wstring(const std::string& str) {
 }
 #endif
 
-// Global flag and expected header for authentication.
-bool require_auth = false;
-std::string g_expected_auth_header;
-
 // --- Help/usage message ---
 void print_usage(const char* progname) {
 #ifdef _WIN32
     std::wstring wprogname = utf8_to_wstring(std::string(progname));
     std::wcout << L"Usage: " << wprogname << L" [options]\n"
         << L"Options:\n"
-        << L"  -h, --help             Print this help message\n"
-        << L"  --port PORT, -p PORT   Set the port (default: 80)\n"
-        << L"  --pass PASSWORD        Enable HTTP Basic authentication (username is always 'admin')\n"
-        << L"                         If not provided, no authentication is enforced.\n";
+        << L"  -h, --help               Print this help message\n"
+        << L"  -p, --port PORT          Set the port (default: 80 for HTTP, 443 for HTTPS)\n"
+        << L"  -i, --index DIR_PATH     Serve static files from a directory. `index.html` is the default page.\n"
+        << L"  --pass PASSWORD          Enable HTTP Basic authentication (username is 'admin')\n"
+        << L"  -s, --ssl                Enable HTTPS mode\n"
+        << L"  -c, --cert CERT_PATH     Path to SSL certificate file (required for --ssl)\n"
+        << L"  -k, --key KEY_PATH       Path to SSL private key file (required for --ssl)\n";
 #else
     std::cout << "Usage: " << progname << " [options]\n"
         << "Options:\n"
-        << "  -h, --help             Print this help message\n"
-        << "  --port PORT, -p PORT   Set the port (default: 80)\n"
-        << "  --pass PASSWORD        Enable HTTP Basic authentication (username is always 'admin')\n"
-        << "                         If not provided, no authentication is enforced.\n";
+        << "  -h, --help               Print this help message\n"
+        << "  -p, --port PORT          Set the port (default: 80 for HTTP, 443 for HTTPS)\n"
+        << "  -i, --index DIR_PATH     Serve static files from a directory. `index.html` is the default page.\n"
+        << "  --pass PASSWORD          Enable HTTP Basic authentication (username is 'admin')\n"
+        << "  -s, --ssl                Enable HTTPS mode\n"
+        << "  -c, --cert CERT_PATH     Path to SSL certificate file (required for --ssl)\n"
+        << "  -k, --key KEY_PATH       Path to SSL private key file (required for --ssl)\n";
 #endif
 }
 
@@ -136,34 +169,26 @@ bool authenticate(const httplib::Request& req, httplib::Response& res) {
 void upload_handler(const httplib::Request& req, httplib::Response& res) {
     if (!authenticate(req, res))
         return;
-
     auto file = req.get_file_value("file");
     if (file.filename.empty()) {
         res.status = 400;
         res.set_content("No file uploaded", "text/plain");
         return;
     }
-
-    // Enforce maximum upload size.
     if (file.content.size() > MAX_UPLOAD_SIZE) {
-        res.status = 413;  // Payload Too Large
+        res.status = 413;
         res.set_content("Uploaded file is too large", "text/plain");
         return;
     }
-
-    // Sanitize the uploaded filename by extracting the base name.
     std::string safeFilename = fs::path(file.filename).filename().string();
     if (safeFilename.empty()) {
         res.status = 400;
         res.set_content("Invalid file name", "text/plain");
         return;
     }
-
-    // Determine target directory from query parameter "dir" (default to ".")
     std::string targetDir = ".";
     if (req.has_param("dir")) {
         targetDir = req.get_param_value("dir");
-        // Reject absolute paths and directory traversal.
         fs::path targetPath(targetDir);
         if (targetPath.is_absolute() || targetDir.find("..") != std::string::npos) {
             res.status = 400;
@@ -171,8 +196,6 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
             return;
         }
     }
-
-    // Build the full target file path.
     fs::path fullPath = fs::u8path(targetDir) / fs::u8path(safeFilename);
     std::ofstream ofs(fullPath, std::ios::binary);
     if (!ofs) {
@@ -185,33 +208,26 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
     res.set_content("File uploaded successfully", "text/plain");
 }
 
-// --- Unified Browse Handler ---
+// --- Unified Browse/Download Handler (for non-root paths) ---
 void browse_handler(const httplib::Request& req, httplib::Response& res) {
     if (!authenticate(req, res))
         return;
-
-    // The captured group (req.matches[1]) contains the requested path.
-    // For "/" (empty match) use current directory.
     std::string dir = req.matches[1];
     if (dir.empty()) {
         dir = ".";
     }
-    // Reject absolute paths and directory traversal attempts.
     fs::path reqPath(dir);
     if (reqPath.is_absolute() || dir.find("..") != std::string::npos) {
         res.status = 400;
         res.set_content("Invalid path", "text/plain");
         return;
     }
-
     fs::path fs_path = fs::u8path(dir);
     if (!fs::exists(fs_path)) {
         res.status = 404;
         res.set_content("Not found", "text/plain");
         return;
     }
-
-    // If the path is a file, serve it for download.
     if (fs::is_regular_file(fs_path)) {
         std::ifstream ifs(fs_path, std::ios::binary);
         if (!ifs) {
@@ -227,7 +243,7 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    // Build the HTML page (using your original layout).
+    // --- HTML with original formatting ---
     std::stringstream html;
     html << "<!DOCTYPE html>\n"
         << "<html lang='en'>\n"
@@ -261,11 +277,8 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         << "|     |  _|  _| | | | -_| . |<br/>"
         << "|__|__|_| |_| |_____|___|___|<br/>"
         << "    </div>\n"
-        << "    <h1>Upload File</h1>\n";
-
-    // Set the form action so that uploads go to the current directory.
-    html << "    <form id='uploadForm' method='POST' action='/upload?dir=" << url_encode(dir)
-        << "' enctype='multipart/form-data'>\n"
+        << "    <h1>Upload File</h1>\n"
+        << "    <form id='uploadForm' method='POST' action='/upload?dir=" << url_encode(dir) << "' enctype='multipart/form-data'>\n"
         << "      <input type='file' name='file'/>\n"
         << "      <input type='submit' value='Upload'/>\n"
         << "      <progress id='uploadProgress' value='0' max='100'></progress>\n"
@@ -274,7 +287,6 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         << "    <h1>Files in " << ((dir == ".") ? "/" : ("/" + dir)) << "</h1>\n"
         << "    <ul>\n";
 
-    // Add a parent directory link if not at the root.
     if (dir != ".") {
         fs::path currentPath = fs::u8path(dir);
         fs::path parent = currentPath.parent_path();
@@ -283,39 +295,16 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         html << "      <li><a href='" << parent_link << u8"'>.. [↩ parent] </a></li>\n";
     }
 
-    // Separate directories and files.
-    std::vector<std::pair<std::string, fs::path>> directories;
-    std::vector<std::pair<std::string, fs::path>> files;
-
+    std::vector<std::pair<std::string, fs::path>> directories, files;
     for (const auto& entry : fs::directory_iterator(fs_path)) {
         std::string name = entry.path().filename().u8string();
-        if (fs::is_directory(entry.path()))
-            directories.push_back({ name, entry.path() });
-        else if (fs::is_regular_file(entry.path()))
-            files.push_back({ name, entry.path() });
+        if (fs::is_directory(entry.path())) directories.push_back({ name, entry.path() });
+        else if (fs::is_regular_file(entry.path())) files.push_back({ name, entry.path() });
     }
-
-    std::sort(directories.begin(), directories.end(), [](auto const& a, auto const& b) {
-        return a.first < b.first;
-        });
-    std::sort(files.begin(), files.end(), [](auto const& a, auto const& b) {
-        return a.first < b.first;
-        });
-
-    // List directories first.
-    for (const auto& p : directories) {
-        std::string name = p.first;
-        std::string link = (dir == ".") ? name : (dir + "/" + name);
-        html << u8"      <li>📁 <a href='/" << link << "'>" << name << "/</a></li>\n";
-    }
-
-    // Then list files.
-    for (const auto& p : files) {
-        std::string name = p.first;
-        std::string link = (dir == ".") ? name : (dir + "/" + name);
-        html << u8"      <li>🗎 <a href='/" << link << "'>" << name << "</a></li>\n";
-    }
-
+    std::sort(directories.begin(), directories.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+    std::sort(files.begin(), files.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+    for (const auto& p : directories) html << u8"      <li>📁 <a href='/" << ((dir == ".") ? "" : dir + "/") << p.first << "'>" << p.first << "/</a></li>\n";
+    for (const auto& p : files) html << u8"      <li>🗎 <a href='/" << ((dir == ".") ? "" : dir + "/") << p.first << "'>" << p.first << "</a></li>\n";
     html << "    </ul>\n"
         << "    <div class='footer'>Version " << VERSION << "</div>\n"
         << "  </div>\n"
@@ -392,7 +381,6 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         << "  </script>\n"
         << "</body>\n"
         << "</html>";
-
     res.set_content(html.str(), "text/html");
 }
 
@@ -400,9 +388,7 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
 bool is_port_free(int port) {
 #ifdef _WIN32
     WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        return false;
-    }
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
 #endif
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
@@ -425,37 +411,114 @@ bool is_port_free(int port) {
     return (result == 0);
 }
 
+// --- Static Content Server Handler ---
+void serve_static_content_handler(const httplib::Request& req, httplib::Response& res) {
+    if (!authenticate(req, res)) {
+        return;
+    }
+    auto relative_path_str = req.matches[1].str();
+    if (relative_path_str.empty() || relative_path_str.back() == '/') {
+        relative_path_str += "index.html";
+    }
+    fs::path requested_path = relative_path_str;
+    fs::path full_path = fs::path(g_web_root_path) / requested_path;
+    auto canonical_root = fs::weakly_canonical(g_web_root_path);
+    auto canonical_full = fs::weakly_canonical(full_path);
+    if (canonical_full.string().rfind(canonical_root.string(), 0) != 0) {
+        res.status = 403;
+        res.set_content("Forbidden: Access denied.", "text/plain");
+        return;
+    }
+    if (!fs::exists(full_path) || !fs::is_regular_file(full_path)) {
+        res.status = 404;
+        res.set_content("Not Found", "text/plain");
+        return;
+    }
+    std::ifstream ifs(full_path, std::ios::binary);
+    if (!ifs) {
+        res.status = 500;
+        res.set_content("Internal Server Error: Could not read file.", "text/plain");
+        return;
+    }
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    res.status = 200;
+    res.set_content(oss.str(), get_mime_type(full_path.string()).c_str());
+}
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
-    // Set the Windows console to use UTF-8 and wide-character output.
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U16TEXT);
+    // Also set stderr to wide mode for consistent error reporting
+    _setmode(_fileno(stderr), _O_U16TEXT);
 #endif
-    // Set the global locale.
     std::setlocale(LC_ALL, "");
 
     int port = 80;
-    std::string auth_password = "";  // Default: no authentication
+    bool port_is_default = true;
+    std::string auth_password = "";
+    bool use_ssl = false;
+    std::string cert_path, key_path;
 
-    // Parse command-line arguments with basic error handling.
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage(argv[0]);
-            return 0;
+        if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return 0; }
+        else if ((arg == "-p" || arg == "--port") && i + 1 < argc) { try { port = std::stoi(argv[++i]); port_is_default = false; } catch (...) { std::cerr << "Invalid port value.\n"; return 1; } }
+        else if (arg == "--pass" && i + 1 < argc) { auth_password = argv[++i]; require_auth = true; }
+        else if (arg == "-s" || arg == "--ssl") { use_ssl = true; }
+        else if ((arg == "-c" || arg == "--cert") && i + 1 < argc) { cert_path = argv[++i]; }
+        else if ((arg == "-k" || arg == "--key") && i + 1 < argc) { key_path = argv[++i]; }
+        else if ((arg == "-i" || arg == "--index") && i + 1 < argc) {
+            g_web_root_path = argv[++i];
         }
-        else if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
-            try {
-                port = std::stoi(argv[++i]);
-            }
-            catch (...) {
-                std::cerr << "Invalid port value.\n";
-                return 1;
-            }
+    }
+
+    if (!g_web_root_path.empty()) {
+        if (!fs::exists(g_web_root_path)) {
+#ifdef _WIN32
+            // Use wide streams and strings on Windows
+            std::wcerr << L"Error: Web root directory not found: " << utf8_to_wstring(g_web_root_path) << std::endl;
+#else
+            std::cerr << "Error: Web root directory not found: " << g_web_root_path << std::endl;
+#endif
+            return 1;
         }
-        else if (arg == "--pass" && i + 1 < argc) {
-            auth_password = argv[++i];
-            require_auth = true;
+        if (!fs::is_directory(g_web_root_path)) {
+#ifdef _WIN32
+            std::wcerr << L"Error: Path provided to --index is not a directory: " << utf8_to_wstring(g_web_root_path) << std::endl;
+#else
+            std::cerr << "Error: Path provided to --index is not a directory: " << g_web_root_path << std::endl;
+#endif
+            return 1;
+        }
+    }
+
+    if (use_ssl) {
+        if (port_is_default) port = 443;
+        if (cert_path.empty() || key_path.empty()) {
+#ifdef _WIN32
+            std::wcerr << L"Error: --cert and --key are required when using --ssl." << std::endl;
+#else
+            std::cerr << "Error: --cert and --key are required when using --ssl." << std::endl;
+#endif
+            print_usage(argv[0]); return 1;
+        }
+        if (!fs::exists(cert_path)) {
+#ifdef _WIN32
+            std::wcerr << L"Error: Certificate file not found: " << utf8_to_wstring(cert_path) << std::endl;
+#else
+            std::cerr << "Error: Certificate file not found: " << cert_path << std::endl;
+#endif
+            return 1;
+        }
+        if (!fs::exists(key_path)) {
+#ifdef _WIN32
+            std::wcerr << L"Error: Key file not found: " << utf8_to_wstring(key_path) << std::endl;
+#else
+            std::cerr << "Error: Key file not found: " << key_path << std::endl;
+#endif
+            return 1;
         }
     }
 
@@ -472,31 +535,50 @@ int main(int argc, char* argv[]) {
         g_expected_auth_header = "Basic " + base64_encode("admin:" + auth_password);
     }
 
-    httplib::Server svr;
-    // All GET requests (including "/") are handled by browse_handler.
-    svr.Get(R"(/(.*))", browse_handler);
-    svr.Post("/upload", upload_handler);
+    std::unique_ptr<httplib::Server> svr;
+    if (use_ssl) {
+        svr = std::make_unique<httplib::SSLServer>(cert_path.c_str(), key_path.c_str());
+    }
+    else {
+        svr = std::make_unique<httplib::Server>();
+    }
+
+    if (!svr) {
+#ifdef _WIN32
+        std::wcerr << L"Error: Could not instantiate server." << std::endl;
+#else
+        std::cerr << "Error: Could not instantiate server." << std::endl;
+#endif
+        return 1;
+    }
+
+    svr->set_payload_max_length(MAX_UPLOAD_SIZE);
+
+    if (!g_web_root_path.empty()) {
+        svr->Get(R"(/(.*))", serve_static_content_handler);
+    }
+    else {
+        svr->Get(R"(/(.*))", browse_handler);
+        svr->Post("/upload", upload_handler);
+    }
 
 #ifdef _WIN32
-    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+    svr->set_logger([](const httplib::Request& req, const httplib::Response& res) {
         std::time_t t = std::time(nullptr);
         std::tm tm;
         localtime_s(&tm, &t);
         wchar_t time_str[100];
         wcsftime(time_str, sizeof(time_str) / sizeof(wchar_t), L"[%d/%b/%Y %H:%M:%S]", &tm);
-        // Build full path including GET params if any using req.params.
         std::wstring fullPath = utf8_to_wstring(req.path);
-        if (req.method == "GET" && !req.params.empty()) {
-            std::string queryStr;
+        if (!req.params.empty()) {
+            std::string queryStr = "?";
             bool first = true;
             for (const auto& param : req.params) {
-                if (!first) {
-                    queryStr += "&";
-                }
+                if (!first) { queryStr += "&"; }
                 queryStr += param.first + "=" + param.second;
                 first = false;
             }
-            fullPath += L"?" + utf8_to_wstring(queryStr);
+            fullPath += utf8_to_wstring(queryStr);
         }
         std::wstring logLine = utf8_to_wstring(req.remote_addr) + L" - - " +
             time_str + L" \"" +
@@ -510,21 +592,18 @@ int main(int argc, char* argv[]) {
         }
         });
 #else
-    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+    svr->set_logger([](const httplib::Request& req, const httplib::Response& res) {
         std::time_t t = std::time(nullptr);
         std::tm tm;
         localtime_r(&t, &tm);
         char time_str[100];
-        std::strftime(time_str, sizeof(time_str), "[%d/%b/%Y %H:%M:%S]", &tm);
-        // Build full path including GET params if any using req.params.
+        std::strftime(time_str, sizeof(time_str), "[%d/%b/%Y:%H:%M:%S]", &tm);
         std::string fullPath = req.path;
-        if (req.method == "GET" && !req.params.empty()) {
+        if (!req.params.empty()) {
             fullPath += "?";
             bool first = true;
             for (const auto& param : req.params) {
-                if (!first) {
-                    fullPath += "&";
-                }
+                if (!first) { fullPath += "&"; }
                 fullPath += param.first + "=" + param.second;
                 first = false;
             }
@@ -539,16 +618,32 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef _WIN32
-    std::wcout << L"Starting HTTP server on port " << port << L"\n";
+    std::wcout << L"Starting " << (use_ssl ? L"HTTPS" : L"HTTP")
+        << L" server on port " << port << L"\n";
+    if (!g_web_root_path.empty()) {
+        std::wcout << L"Serving static files from web root: " << utf8_to_wstring(g_web_root_path) << L"\n";
+    }
+    else {
+        std::wcout << L"Running in file browser/upload mode.\n";
+    }
 #else
-    std::cout << "Starting HTTP server on port " << port << "\n";
+    std::cout << "Starting " << (use_ssl ? "HTTPS" : "HTTP")
+        << " server on port " << port << "\n";
+    if (!g_web_root_path.empty()) {
+        std::cout << "Serving static files from web root: " << g_web_root_path << "\n";
+    }
+    else {
+        std::cout << "Running in file browser/upload mode.\n";
+    }
 #endif
 
-    if (!svr.listen("0.0.0.0", port)) {
+    if (!svr->listen("0.0.0.0", port)) {
 #ifdef _WIN32
-        std::wcerr << L"Error: Failed to start HTTP server on port " << port << L". It might be busy." << std::endl;
+        std::wcerr << L"Error: Failed to start " << (use_ssl ? L"HTTPS" : L"HTTP")
+            << L" server on port " << port << L". It might be busy." << std::endl;
 #else
-        std::cerr << "Error: Failed to start HTTP server on port " << port << ". It might be busy." << std::endl;
+        std::cerr << "Error: Failed to start " << (use_ssl ? "HTTPS" : "HTTP")
+            << " server on port " << port << ". It might be busy." << std::endl;
 #endif
         return 1;
     }
