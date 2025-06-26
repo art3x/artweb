@@ -71,7 +71,7 @@ ArtWeb is configured using the following command-line flags:
     ArtWeb.exe --port 8080
     ```
 
-2.  **Serve a static website from the `C:\projects\my-site\build` directory:**
+2.  **Serve a static website from the `C:\projects\my-site` directory:**
     ```sh
     ArtWeb.exe -i C:\projects\my-site
     ```
