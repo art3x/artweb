@@ -12,6 +12,7 @@
 #include <clocale>    // For setlocale
 #include <memory>     // For std::unique_ptr
 #include <map>        // For MIME types
+#include <cstdlib>
 
 #if __has_include(<filesystem>)
 #include <filesystem>
@@ -30,20 +31,27 @@ namespace fs = std::experimental::filesystem;
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
+#include <iphlpapi.h>   
+#include <cwctype>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #endif
 
+
 // --- Version number ---
-const std::string VERSION = "v2.0";
+const std::string VERSION = "v2.1";
 
 // --- Maximum allowed file upload size (1 GB) ---
 const std::size_t MAX_UPLOAD_SIZE = 1024 * 1024 * 1024;
 
+// ------------------------ Helpers ------------------------
 
 std::string get_mime_type(const std::string& path) {
     auto pos = path.rfind('.');
@@ -53,27 +61,34 @@ std::string get_mime_type(const std::string& path) {
     auto ext = path.substr(pos);
     static const std::map<std::string, std::string> mime_map = {
         {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"},
-        {".js", "application/javascript"}, {".json", "application/json"},
-        {".xml", "application/xml"}, {".txt", "text/plain"}, {".jpg", "image/jpeg"},
-        {".jpeg", "image/jpeg"}, {".png", "image/png"}, {".gif", "image/gif"},
-        {".svg", "image/svg+xml"}, {".ico", "image/x-icon"}, {".woff", "font/woff"},
-        {".woff2", "font/woff2"}, {".ttf", "font/ttf"}, {".mp4", "video/mp4"},
-        {".webm", "video/webm"}, {".mp3", "audio/mpeg"}, {".ogg", "audio/ogg"},
-        {".wav", "audio/wav"}, {".pdf", "application/pdf"}, {".zip", "application/zip"},
+        {".js", "application/javascript"}, {".mjs", "application/javascript"},
+        {".json", "application/json"}, {".xml", "application/xml"},
+        {".txt", "text/plain"}, {".csv", "text/csv"},
+        {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},
+        {".png", "image/png"}, {".gif", "image/gif"},
+        {".svg", "image/svg+xml"}, {".ico", "image/x-icon"},
+        {".woff", "font/woff"}, {".woff2", "font/woff2"}, {".ttf", "font/ttf"},
+        {".mp4", "video/mp4"}, {".webm", "video/webm"},
+        {".mp3", "audio/mpeg"}, {".ogg", "audio/ogg"}, {".wav", "audio/wav"},
+        {".pdf", "application/pdf"}, {".zip", "application/zip"}
     };
     auto it = mime_map.find(ext);
-    if (it != mime_map.end()) {
-        return it->second;
-    }
+    if (it != mime_map.end()) return it->second;
     return "application/octet-stream";
 }
 
-// Global variables for configuration
-bool require_auth = false;
-std::string g_expected_auth_header;
-std::string g_web_root_path; // Path to the web root directory
+// If the content type is "text-like", append charset for correct rendering
+std::string add_charset_if_text(const std::string& mime) {
+    if (mime.rfind("text/", 0) == 0 ||
+        mime == "application/javascript" ||
+        mime == "application/json" ||
+        mime == "application/xml") {
+        return mime + "; charset=utf-8";
+    }
+    return mime;
+}
 
-// --- Base64 encoding (for HTTP Basic Auth) ---
+// Base64 encoding (for HTTP Basic Auth)
 static const std::string base64_chars =
 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 "abcdefghijklmnopqrstuvwxyz"
@@ -90,14 +105,12 @@ std::string base64_encode(const std::string& in) {
             valb -= 6;
         }
     }
-    if (valb > -6)
-        out.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
-    while (out.size() % 4)
-        out.push_back('=');
+    if (valb > -6) out.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
     return out;
 }
 
-// --- URL encode helper function ---
+// URL encode helper
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
     escaped.fill('0');
@@ -113,11 +126,89 @@ std::string url_encode(const std::string& value) {
     return escaped.str();
 }
 
-// --- Helper: convert UTF-8 string to wide string on Windows ---
+
+
+// Make first N bytes printable/safe for logs (CR/LF/TAB preserved, others as \xHH)
+std::string sanitize_for_log(const std::string& s, size_t maxlen = 1024) {
+    std::ostringstream o;
+    o << std::uppercase << std::hex;
+    size_t n = std::min(s.size(), maxlen);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\r') { o << "\\r"; }
+        else if (c == '\n') { o << "\\n"; }
+        else if (c == '\t') { o << "\\t"; }
+        else if (c >= 32 && c < 127) {
+            o << static_cast<char>(c);
+        }
+        else {
+            o << "\\x" << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+    }
+    if (s.size() > maxlen) o << "…(truncated)";
+    return o.str();
+}
+
+// POST logging
+std::string build_post_preview(const httplib::Request& req, size_t maxlen = 1024) {
+
+    if (!req.body.empty()) {
+        return sanitize_for_log(req.body, maxlen);
+    }
+
+    if (!req.params.empty()) {
+        std::string kvs;
+        for (auto it = req.params.begin(); it != req.params.end(); ++it) {
+            if (!kvs.empty()) kvs += "&";
+            kvs += it->first + "=" + it->second;
+            if (kvs.size() >= maxlen) break;
+        }
+        if (kvs.size() > maxlen) kvs.resize(maxlen);
+        return sanitize_for_log(kvs, maxlen);
+    }
+
+    if (!req.files.empty()) {
+        std::string out;
+        for (const auto& kv : req.files) {
+            const auto& name = kv.first;
+            const auto& f = kv.second; // MultipartFormData
+
+            if (f.filename.empty()) {
+                // Treat as a normal form field: name=value
+                std::string val = sanitize_for_log(f.content, maxlen);
+                if (!out.empty()) out += "&";
+                out += name + "=" + val;
+            }
+            else {
+                // Real file upload: print safe metadata only
+                std::string meta = name + ":[filename=" + f.filename
+                    + ", type=" + f.content_type
+                    + ", size=" + std::to_string(f.content.size()) + "]";
+                if (!out.empty()) out += "; ";
+                out += meta;
+            }
+
+            if (out.size() >= maxlen) break;
+        }
+        if (out.size() > maxlen) out.resize(maxlen);
+        // Already sanitized field values above; metadata is ASCII.
+        return out;
+    }
+
+    return {}; // nothing we can show
+}
+
+
+// ------------------------ Globals ------------------------
+
+bool require_auth = false;
+std::string g_expected_auth_header;
+std::string g_web_root_path; // Path to the web root directory
+
+// Helper: convert UTF-8 string to wide string on Windows
 #ifdef _WIN32
 std::wstring utf8_to_wstring(const std::string& str) {
-    if (str.empty())
-        return std::wstring();
+    if (str.empty()) return std::wstring();
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
     std::wstring wstr(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size_needed);
@@ -125,7 +216,247 @@ std::wstring utf8_to_wstring(const std::string& str) {
 }
 #endif
 
-// --- Help/usage message ---
+
+
+
+// ANSI color support
+inline bool supports_color() {
+#ifdef _WIN32
+    // Enable Virtual Terminal Processing (VT) if possible
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return false;
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) {
+        // Not a console (redirected) OR very old console host -> no color
+        return false;
+    }
+
+    DWORD newMode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (!SetConsoleMode(hOut, newMode)) {
+        // Classic cmd.exe (without VT) will fail here -> no color
+        return false;
+    }
+    return true;
+#else
+    // Respect NO_COLOR spec and avoid coloring when not a TTY or in "dumb" term
+    if (std::getenv("NO_COLOR")) return false;
+#include <unistd.h>
+    if (!isatty(STDOUT_FILENO)) return false;
+    const char* term = std::getenv("TERM");
+    if (!term || std::string(term) == "dumb") return false;
+    return true;
+#endif
+}
+
+inline std::string colorize_blue(const std::string& s) {
+    static const char* BLUE = "\x1b[34m";
+    static const char* RESET = "\x1b[0m";
+    return std::string(BLUE) + s + RESET;
+}
+inline std::string colorize_green(const std::string& s) {
+    static const char* GREEN = "\x1b[32m";
+    static const char* RESET = "\x1b[0m";
+    return std::string(GREEN) + s + RESET;
+}
+inline std::string colorize_yellow(const std::string& s) {
+    static const char* YELLOW = "\x1b[33m";
+    static const char* RESET = "\x1b[0m";
+    return std::string(YELLOW) + s + RESET;
+}
+
+
+
+//Logo
+inline std::string make_startup_logo() {
+    std::string ver = VERSION;
+    if (!ver.empty() && (ver[0] == 'v' || ver[0] == 'V')) {
+        ver.erase(0, 1);
+    }
+
+    std::ostringstream s;
+    s <<
+        R"(
+ _____     _   _ _ _     _        
+|  _  |___| |_| | | |___| |_
+|     |  _|  _| | | | -_| . |
+|__|__|_| |_| |_____|___|___| 
+)";
+    return s.str();
+}
+
+
+inline std::string make_startup_footer() {
+    std::string ver = VERSION;                // e.g., "v2.1"
+    if (!ver.empty() && (ver[0] == 'v' || ver[0] == 'V')) ver.erase(0, 1);
+
+    std::ostringstream s;
+    s << "ArtWeb by @art3x      ver " << ver << "\n"
+        << "https://github.com/art3x\n\n";
+    return s.str();
+}
+
+inline void print_logo() {
+    std::string logo = make_startup_logo();
+    std::string footer = make_startup_footer();
+
+    if (supports_color()) {
+        logo = colorize_green(logo);
+        footer = colorize_blue(footer);
+    }
+
+#ifdef _WIN32
+    std::wcout << utf8_to_wstring(logo);
+    std::wcout << utf8_to_wstring(footer);
+#else
+    std::cout << logo << footer;
+#endif
+}
+
+
+#ifdef _WIN32
+inline std::wstring to_lower(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+        [](wchar_t c) { return std::towlower(c); });
+    return s;
+}
+
+inline bool starts_with_icase(const std::wstring& s, const std::wstring& pref) {
+    if (s.size() < pref.size()) return false;
+    auto sl = to_lower(s);
+    auto pl = to_lower(pref);
+    return std::equal(pl.begin(), pl.end(), sl.begin());
+}
+
+inline bool contains_icase(const std::wstring& s, const std::wstring& needle) {
+    auto sl = to_lower(s);
+    auto nl = to_lower(needle);
+    return sl.find(nl) != std::wstring::npos;
+}
+#endif
+
+
+inline void print_ipv4_list_after_logo() {
+#ifdef _WIN32
+    // Enumerate adapters (IPv4 only)
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG fam = AF_UNSPEC; // we'll filter per unicast addr
+    ULONG sz = 0;
+    if (GetAdaptersAddresses(fam, flags, nullptr, nullptr, &sz) != ERROR_BUFFER_OVERFLOW || sz == 0) {
+        return;
+    }
+    std::vector<unsigned char> buf(sz);
+    IP_ADAPTER_ADDRESSES* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    if (GetAdaptersAddresses(fam, flags, nullptr, addrs, &sz) != NO_ERROR) {
+        return;
+    }
+
+    // Collect (name, ip) pairs, filtered by interface name
+    std::vector<std::pair<std::wstring, std::wstring>> entries;
+
+    for (auto* a = addrs; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+
+        std::wstring name = a->FriendlyName ? a->FriendlyName : L"";
+        if (name.empty()) continue;
+
+        // Filter: Linux-like prefixes + common Windows equivalents
+        bool match =
+            starts_with_icase(name, L"eth") ||
+            starts_with_icase(name, L"ens") ||
+            starts_with_icase(name, L"tun") ||
+            starts_with_icase(name, L"ethernet") ||
+            starts_with_icase(name, L"vEthernet") ||
+            contains_icase(name, L"Wi-Fi") ||            
+            contains_icase(name, L"TAP") ||
+            contains_icase(name, L"TUN") ||
+            contains_icase(name, L"WireGuard") ||
+            contains_icase(name, L"OpenVPN");
+
+        if (!match) continue;
+
+        for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+            if (!ua->Address.lpSockaddr) continue;
+            if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+
+            auto* sin = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
+            wchar_t ipw[64] = L"";
+            if (InetNtopW(AF_INET, &sin->sin_addr, ipw, 64)) {
+                entries.emplace_back(name, std::wstring(ipw));
+            }
+        }
+    }
+
+    std::sort(entries.begin(), entries.end());
+    std::wostringstream oss;
+    if (!entries.empty()) {
+        oss << L"Listening on:\n";
+        for (auto& e : entries) {
+            oss << L"  " << e.first << L": " << e.second << L"\n";
+        }
+    }
+    else {
+        oss << L"Listening on: can't find any\n";
+    }
+
+    std::wstring out = oss.str();
+
+    // Optional: colorize blue if VT is enabled
+    if (supports_color()) {
+        std::wcout << L"\x1b[33m" << out << L"\x1b[0m";
+    }
+    else {
+        std::wcout << out;
+    }
+   
+
+#else
+    // POSIX: use getifaddrs for eth*/ens*/tun*
+    ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0 || !ifaddr) return;
+
+    std::vector<std::pair<std::string, std::string>> entries;
+
+    for (ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa || !ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+
+        std::string name = ifa->ifa_name;
+        if (!(name.rfind("eth", 0) == 0 || name.rfind("ens", 0) == 0 || name.rfind("tun", 0) == 0)) {
+            continue;
+        }
+
+        char buf[INET_ADDRSTRLEN] = { 0 };
+        auto* sin = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+            entries.emplace_back(name, std::string(buf));
+        }
+    }
+    freeifaddrs(ifaddr);
+
+    std::sort(entries.begin(), entries.end());
+
+    std::ostringstream oss;
+    if (!entries.empty()) {
+        oss << "Listening on:\n";
+        for (auto& e : entries) {
+            oss << "  " << e.first << ": " << e.second << "\n";
+        }
+    }
+    else {
+        oss << "Listening on: can't find any\n";
+    }
+
+    std::string out = oss.str();
+    if (supports_color()) out = colorize_yellow(out);
+    std::cout << out;
+#endif
+}
+
+
+
+// Help/usage
 void print_usage(const char* progname) {
 #ifdef _WIN32
     std::wstring wprogname = utf8_to_wstring(std::string(progname));
@@ -151,10 +482,9 @@ void print_usage(const char* progname) {
 #endif
 }
 
-// --- HTTP Basic Auth check ---
+// HTTP Basic Auth check
 bool authenticate(const httplib::Request& req, httplib::Response& res) {
-    if (!require_auth)
-        return true;
+    if (!require_auth) return true;
     auto auth = req.get_header_value("Authorization");
     if (auth != g_expected_auth_header) {
         res.status = 401;
@@ -165,10 +495,10 @@ bool authenticate(const httplib::Request& req, httplib::Response& res) {
     return true;
 }
 
-// --- File Upload Handler ---
+// File Upload Handler
 void upload_handler(const httplib::Request& req, httplib::Response& res) {
-    if (!authenticate(req, res))
-        return;
+    if (!authenticate(req, res)) return;
+
     auto file = req.get_file_value("file");
     if (file.filename.empty()) {
         res.status = 400;
@@ -186,36 +516,67 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
         res.set_content("Invalid file name", "text/plain");
         return;
     }
-    std::string targetDir = ".";
+
+
+
+    const fs::path upload_root = fs::current_path();
+    auto canonical_root = fs::weakly_canonical(upload_root);
+
+    std::string targetDirStr = ".";
     if (req.has_param("dir")) {
-        targetDir = req.get_param_value("dir");
-        fs::path targetPath(targetDir);
-        if (targetPath.is_absolute() || targetDir.find("..") != std::string::npos) {
-            res.status = 400;
-            res.set_content("Invalid target directory", "text/plain");
+        targetDirStr = req.get_param_value("dir");
+    }
+
+    fs::path requested_path = upload_root / fs::u8path(targetDirStr);
+    auto canonical_target_dir = fs::weakly_canonical(requested_path);
+
+
+    if (canonical_target_dir.string().rfind(canonical_root.string(), 0) != 0) {
+        res.status = 403; 
+        res.set_content("Forbidden: Invalid target directory.", "text/plain");
+        return;
+    }
+
+    fs::path fullPath = canonical_target_dir / fs::u8path(safeFilename);
+
+    // Check for file overwrite.
+    if (fs::exists(fullPath)) {
+        res.status = 409; // Conflict
+        res.set_content("File with this name already exists", "text/plain");
+        return;
+    }
+
+    std::ofstream ofs(fullPath, std::ios::binary);
+    if (!ofs) {
+        // Before creating the directory, ensure the parent path is still safe.
+        // This is a defense-in-depth check.
+        if (fullPath.parent_path().string().rfind(canonical_root.string(), 0) != 0) {
+            res.status = 403;
+            res.set_content("Forbidden: Cannot create directory in this location.", "text/plain");
+            return;
+        }
+        // Attempt to create the directory if it doesn't exist.
+        fs::create_directories(fullPath.parent_path());
+        ofs.open(fullPath, std::ios::binary); // Try again
+        if (!ofs) {
+            res.status = 500;
+            res.set_content("Failed to save file", "text/plain");
             return;
         }
     }
-    fs::path fullPath = fs::u8path(targetDir) / fs::u8path(safeFilename);
-    std::ofstream ofs(fullPath, std::ios::binary);
-    if (!ofs) {
-        res.status = 500;
-        res.set_content("Failed to save file", "text/plain");
-        return;
-    }
+
     ofs.write(file.content.data(), file.content.size());
     ofs.close();
     res.set_content("File uploaded successfully", "text/plain");
 }
 
-// --- Unified Browse/Download Handler (for non-root paths) ---
+// Unified Browse/Download Handler (for non-root paths)
 void browse_handler(const httplib::Request& req, httplib::Response& res) {
-    if (!authenticate(req, res))
-        return;
+    if (!authenticate(req, res)) return;
+
     std::string dir = req.matches[1];
-    if (dir.empty()) {
-        dir = ".";
-    }
+    if (dir.empty()) dir = ".";
+
     fs::path reqPath(dir);
     if (reqPath.is_absolute() || dir.find("..") != std::string::npos) {
         res.status = 400;
@@ -237,13 +598,30 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
-        ifs.close();
-        res.set_content(oss.str(), "application/octet-stream");
-        res.set_header("Content-Disposition", "attachment; filename=\"" + fs_path.filename().u8string() + "\"");
+
+        const auto mime = get_mime_type(fs_path.string());
+        const auto content_type = add_charset_if_text(mime);
+
+        res.status = 200;
+        res.set_content(oss.str(), content_type.c_str());
+
+        // Only force download for unknown/binary types
+        const bool likely_binary =
+            (mime == "application/octet-stream") ||
+            (mime.rfind("application/", 0) == 0 &&
+                mime != "application/json" &&
+                mime != "application/javascript" &&
+                mime != "application/xml" &&
+                mime != "application/pdf");
+
+        if (likely_binary) {
+            res.set_header("Content-Disposition",
+                "attachment; filename=\"" + fs_path.filename().u8string() + "\"");
+        }
         return;
     }
 
-    // --- HTML with original formatting ---
+    // --- HTML directory listing ---
     std::stringstream html;
     html << "<!DOCTYPE html>\n"
         << "<html lang='en'>\n"
@@ -312,79 +690,52 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
         << "    document.getElementById('uploadForm').addEventListener('submit', function(event) {\n"
         << "      event.preventDefault();\n"
         << "      var fileInput = document.querySelector('input[type=\"file\"]');\n"
-        << "      if (!fileInput.files.length) {\n"
-        << "        alert('Please select a file.');\n"
-        << "        return;\n"
-        << "      }\n"
-        << "      var formData = new FormData();\n"
-        << "      formData.append('file', fileInput.files[0]);\n"
-        << "      var xhr = new XMLHttpRequest();\n"
-        << "      xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
+        << "      if (!fileInput.files.length) { alert('Please select a file.'); return; }\n"
+        << "      var formData = new FormData(); formData.append('file', fileInput.files[0]);\n"
+        << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
         << "      xhr.upload.addEventListener('progress', function(e) {\n"
         << "        if (e.lengthComputable) {\n"
         << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
         << "          document.getElementById('uploadProgress').value = percentComplete;\n"
         << "        }\n"
         << "      });\n"
-        << "      xhr.onloadstart = function() {\n"
-        << "        document.getElementById('uploadProgress').style.display = 'block';\n"
-        << "      };\n"
+        << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
         << "      xhr.onloadend = function() {\n"
         << "        document.getElementById('uploadProgress').style.display = 'none';\n"
-        << "        if (xhr.status === 200) {\n"
-        << "          alert('Upload complete!');\n"
-        << "          window.location.reload();\n"
-        << "        } else {\n"
-        << "          alert('Upload failed.');\n"
-        << "        }\n"
+        << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
+        << "        else { alert('Upload failed.'); }\n"
         << "      };\n"
         << "      xhr.send(formData);\n"
         << "    });\n"
         << "    var dropZone = document.getElementById('dropZone');\n"
-        << "    dropZone.addEventListener('dragover', function(e) {\n"
-        << "      e.preventDefault();\n"
-        << "      dropZone.style.backgroundColor = '#e0e0e0';\n"
-        << "    });\n"
-        << "    dropZone.addEventListener('dragleave', function(e) {\n"
-        << "      e.preventDefault();\n"
-        << "      dropZone.style.backgroundColor = '';\n"
-        << "    });\n"
+        << "    dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.style.backgroundColor = '#e0e0e0'; });\n"
+        << "    dropZone.addEventListener('dragleave', function(e) { e.preventDefault(); dropZone.style.backgroundColor = ''; });\n"
         << "    dropZone.addEventListener('drop', function(e) {\n"
-        << "      e.preventDefault();\n"
-        << "      dropZone.style.backgroundColor = '';\n"
-        << "      var files = e.dataTransfer.files;\n"
-        << "      if (files.length === 0) return;\n"
-        << "      var formData = new FormData();\n"
-        << "      formData.append('file', files[0]);\n"
-        << "      var xhr = new XMLHttpRequest();\n"
-        << "      xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
+        << "      e.preventDefault(); dropZone.style.backgroundColor = '';\n"
+        << "      var files = e.dataTransfer.files; if (files.length === 0) return;\n"
+        << "      var formData = new FormData(); formData.append('file', files[0]);\n"
+        << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
         << "      xhr.upload.addEventListener('progress', function(e) {\n"
         << "        if (e.lengthComputable) {\n"
         << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
         << "          document.getElementById('uploadProgress').value = percentComplete;\n"
         << "        }\n"
         << "      });\n"
-        << "      xhr.onloadstart = function() {\n"
-        << "        document.getElementById('uploadProgress').style.display = 'block';\n"
-        << "      };\n"
+        << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
         << "      xhr.onloadend = function() {\n"
         << "        document.getElementById('uploadProgress').style.display = 'none';\n"
-        << "        if (xhr.status === 200) {\n"
-        << "          alert('Upload complete!');\n"
-        << "          window.location.reload();\n"
-        << "        } else {\n"
-        << "          alert('Upload failed.');\n"
-        << "        }\n"
+        << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
+        << "        else { alert('Upload failed.'); }\n"
         << "      };\n"
         << "      xhr.send(formData);\n"
         << "    });\n"
         << "  </script>\n"
         << "</body>\n"
         << "</html>";
-    res.set_content(html.str(), "text/html");
+    res.set_content(html.str(), "text/html; charset=utf-8");
 }
 
-// --- Check if a port is free by attempting to bind ---
+// Check if a port is free by attempting to bind
 bool is_port_free(int port) {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -411,17 +762,17 @@ bool is_port_free(int port) {
     return (result == 0);
 }
 
-// --- Static Content Server Handler ---
+// Static Content Server Handler
 void serve_static_content_handler(const httplib::Request& req, httplib::Response& res) {
-    if (!authenticate(req, res)) {
-        return;
-    }
+    if (!authenticate(req, res)) return;
+
     auto relative_path_str = req.matches[1].str();
     if (relative_path_str.empty() || relative_path_str.back() == '/') {
         relative_path_str += "index.html";
     }
     fs::path requested_path = relative_path_str;
     fs::path full_path = fs::path(g_web_root_path) / requested_path;
+
     auto canonical_root = fs::weakly_canonical(g_web_root_path);
     auto canonical_full = fs::weakly_canonical(full_path);
     if (canonical_full.string().rfind(canonical_root.string(), 0) != 0) {
@@ -443,17 +794,18 @@ void serve_static_content_handler(const httplib::Request& req, httplib::Response
     std::ostringstream oss;
     oss << ifs.rdbuf();
     res.status = 200;
-    res.set_content(oss.str(), get_mime_type(full_path.string()).c_str());
+    const auto mime = get_mime_type(full_path.string());
+    res.set_content(oss.str(), add_charset_if_text(mime).c_str());
 }
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U16TEXT);
-    // Also set stderr to wide mode for consistent error reporting
     _setmode(_fileno(stderr), _O_U16TEXT);
 #endif
     std::setlocale(LC_ALL, "");
+
 
     int port = 80;
     bool port_is_default = true;
@@ -469,15 +821,15 @@ int main(int argc, char* argv[]) {
         else if (arg == "-s" || arg == "--ssl") { use_ssl = true; }
         else if ((arg == "-c" || arg == "--cert") && i + 1 < argc) { cert_path = argv[++i]; }
         else if ((arg == "-k" || arg == "--key") && i + 1 < argc) { key_path = argv[++i]; }
-        else if ((arg == "-i" || arg == "--index") && i + 1 < argc) {
-            g_web_root_path = argv[++i];
-        }
+        else if ((arg == "-i" || arg == "--index") && i + 1 < argc) { g_web_root_path = argv[++i]; }
     }
+
+    print_logo();
+    print_ipv4_list_after_logo();
 
     if (!g_web_root_path.empty()) {
         if (!fs::exists(g_web_root_path)) {
 #ifdef _WIN32
-            // Use wide streams and strings on Windows
             std::wcerr << L"Error: Web root directory not found: " << utf8_to_wstring(g_web_root_path) << std::endl;
 #else
             std::cerr << "Error: Web root directory not found: " << g_web_root_path << std::endl;
@@ -562,6 +914,17 @@ int main(int argc, char* argv[]) {
         svr->Post("/upload", upload_handler);
     }
 
+    // Catch-all POST handler (MUST be registered after real POST routes)
+    // Ensures body parsing & logging even for unknown POST endpoints (404).
+    svr->Post(R"(/(.*))", [](const httplib::Request& req, httplib::Response& res) {
+        // Respect authentication if enabled
+        if (require_auth) {
+            if (!authenticate(req, res)) return; // sends 401
+        }
+        res.status = 404;
+        res.set_content("Not Found", "text/plain");
+        });
+
 #ifdef _WIN32
     svr->set_logger([](const httplib::Request& req, const httplib::Response& res) {
         std::time_t t = std::time(nullptr);
@@ -586,9 +949,13 @@ int main(int argc, char* argv[]) {
             fullPath + L" HTTP/1.1\" " +
             std::to_wstring(res.status) + L" -\n";
         std::wcout << logLine;
-        if (req.method == "POST" && !req.body.empty() && req.body.size() < 1024) {
-            std::wstring postData = utf8_to_wstring(req.body);
-            std::wcout << L"POST data: " << postData << L"\n";
+
+        if (req.method == "POST") {
+            auto preview = build_post_preview(req, 1024);
+            if (!preview.empty()) {
+                std::wcout << L"POST body (first 1024 bytes): "
+                    << utf8_to_wstring(preview) << L"\n";
+            }
         }
         });
 #else
@@ -611,8 +978,13 @@ int main(int argc, char* argv[]) {
         std::cout << req.remote_addr << " - - " << time_str << " \""
             << req.method << " " << fullPath << " HTTP/1.1\" "
             << res.status << " -\n";
-        if (req.method == "POST" && !req.body.empty() && req.body.size() < 1024) {
-            std::cout << "POST data: " << req.body << "\n";
+
+        if (req.method == "POST") {
+            auto preview = build_post_preview(req, 1024);
+            if (!preview.empty()) {
+                std::cout << "POST body (first 1024 bytes): "
+                    << preview << "\n";
+            }
         }
         });
 #endif

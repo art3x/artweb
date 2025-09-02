@@ -1,5 +1,7 @@
 # ArtWeb: Lightweight Cross-Platform Web Server
 
+![ArtWeb](images/artweb_rocks.png)
+
 **ArtWeb** is a lightweight, high-performance, command-line HTTP/HTTPS web server written in C++. Designed for simplicity and portability, it is compiled into a single, self-contained executable with no external runtime dependencies, making it incredibly easy to deploy and run on both Windows and Linux systems.
 
 The server is highly versatile and operates in two distinct modes: a **Static File Server** for hosting standard websites, and a **File Browser & Uploader** for simple, web-based file management and sharing. With support for SSL/TLS, password protection, and large file transfers, ArtWeb is a powerful tool for developers, secirity researchers, and penetration testers who need a quick and reliable web server.
