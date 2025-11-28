@@ -83,3 +83,8 @@ ArtWeb is configured using the following command-line flags:
     ArtWeb.exe -s --cert mycert.pem --key mykey.pem --pass MySecretPassword123
     ```
     *(This will start an HTTPS server on the default port 443. Access it at `https://localhost`)*
+
+4. **Curl upload**
+    ```sh
+    curl -X POST -F file=@filename 'http://<url_of_ArtWeb>/upload'
+    ```
