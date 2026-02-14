@@ -21,7 +21,8 @@ The server is highly versatile and operates in two distinct modes: a **Static Fi
 *   **Cross-Platform:** A single codebase that compiles and runs natively on both Windows and Linux.
 *   **Dual-Mode Operation:** Functions as either a standard static web server or a dynamic file management tool.
 *   **HTTP Basic Authentication:** Protect your server with a simple username (`admin`) and password, ideal for securing private files or internal development sites.
-*   **File uploads:** Handles file uploads up to 1 GB in size (with drag&drop and progress bar).
+*   **File uploads:** Handles file uploads up to 1 GB by default + unlimited size (with drag&drop and progress bar).
+*   **Proxy uploads:** Support of proxy-safe (chunked) uploads
 *   **Detailed Logging:** Prints Apache-style access logs to the console for every request, showing the client's IP address, timestamp, request method, path, POST data and status code.
 
 ---
@@ -56,15 +57,18 @@ If the `--index` flag is not used, ArtWeb starts in its default file management 
 
 ArtWeb is configured using the following command-line flags:
 
-| Short | Long | Description |
-| :--- | :--- | :--- |
-| `-h` | `--help` | Prints this help message and exits. |
-| `-p` | `--port` | Sets the port to listen on. Defaults to `80` for HTTP and `443` for HTTPS. |
-| `-i` | `--index` | **(Switches to Static Server Mode)**. Specifies the path to the web root directory. |
-| | `--pass` | Enables HTTP Basic Authentication. Requires a password argument. The username is always `admin`. |
-| `-s` | `--ssl` | Enables HTTPS mode. Requires `--cert` and `--key` to be specified. |
-| `-c` | `--cert` | Specifies the path to the SSL certificate file (`.pem`). |
-| `-k` | `--key` | Specifies the path to the SSL private key file (`.pem`). |
+```
+Options:
+  -h, --help               Print this help message
+  -p, --port PORT          Set the port (default: 80 for HTTP, 443 for HTTPS)
+  -i, --index DIR_PATH     Serve static files from a directory. `index.html` is the default page.
+  --pass PASSWORD          Enable HTTP Basic authentication (username is 'admin')
+  --proxy                  Use proxy-safe (chunked) uploads (slower, but proxy friendly)
+  --unlim                  Unlimited upload size (more than 1 Gb)
+  -s, --ssl                Enable HTTPS mode
+  -c, --cert CERT_PATH     Path to SSL certificate file (required for --ssl)
+  -k, --key KEY_PATH       Path to SSL private key file (required for --ssl)
+```
 
 #### Examples
 

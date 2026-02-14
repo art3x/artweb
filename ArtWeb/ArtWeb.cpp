@@ -12,6 +12,8 @@
 #include <clocale>    // For setlocale
 #include <memory>     // For std::unique_ptr
 #include <map>        // For MIME types
+#include <mutex>
+#include <limits>
 #include <cstdlib>
 
 #if __has_include(<filesystem>)
@@ -46,7 +48,7 @@ namespace fs = std::experimental::filesystem;
 
 
 // --- Version number ---
-const std::string VERSION = "v2.1";
+const std::string VERSION = "v2.2";
 
 // --- Maximum allowed file upload size (1 GB) ---
 const std::size_t MAX_UPLOAD_SIZE = 1024 * 1024 * 1024;
@@ -124,6 +126,53 @@ std::string url_encode(const std::string& value) {
         }
     }
     return escaped.str();
+}
+
+// URL decode helper (percent-decoding). '+' is kept as '+' (this is for paths too).
+std::string url_decode(const std::string& value) {
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+        };
+
+    std::string out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        char c = value[i];
+        if (c == '%' && i + 2 < value.size()) {
+            int hi = hexval(value[i + 1]);
+            int lo = hexval(value[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Encode each path segment but keep '/' separators.
+std::string url_encode_path(const std::string& path) {
+    std::string out;
+    out.reserve(path.size());
+    std::string seg;
+    for (size_t i = 0; i < path.size(); ++i) {
+        char c = path[i];
+        if (c == '/') {
+            out += url_encode(seg);
+            out.push_back('/');
+            seg.clear();
+        }
+        else {
+            seg.push_back(c);
+        }
+    }
+    out += url_encode(seg);
+    return out;
 }
 
 
@@ -204,6 +253,8 @@ std::string build_post_preview(const httplib::Request& req, size_t maxlen = 1024
 bool require_auth = false;
 std::string g_expected_auth_header;
 std::string g_web_root_path; // Path to the web root directory
+bool g_proxy_upload_mode = false;   // Use proxy-safe (chunked) browser uploads
+bool g_unlimited_upload = false;    // Disable upload size limits
 
 // Helper: convert UTF-8 string to wide string on Windows
 #ifdef _WIN32
@@ -367,7 +418,7 @@ inline void print_ipv4_list_after_logo() {
             starts_with_icase(name, L"tun") ||
             starts_with_icase(name, L"ethernet") ||
             starts_with_icase(name, L"vEthernet") ||
-            contains_icase(name, L"Wi-Fi") ||            
+            contains_icase(name, L"Wi-Fi") ||
             contains_icase(name, L"TAP") ||
             contains_icase(name, L"TUN") ||
             contains_icase(name, L"WireGuard") ||
@@ -408,7 +459,7 @@ inline void print_ipv4_list_after_logo() {
     else {
         std::wcout << out;
     }
-   
+
 
 #else
     // POSIX: use getifaddrs for eth*/ens*/tun*
@@ -466,6 +517,8 @@ void print_usage(const char* progname) {
         << L"  -p, --port PORT          Set the port (default: 80 for HTTP, 443 for HTTPS)\n"
         << L"  -i, --index DIR_PATH     Serve static files from a directory. `index.html` is the default page.\n"
         << L"  --pass PASSWORD          Enable HTTP Basic authentication (username is 'admin')\n"
+        << L"  --proxy                  Use proxy-safe (chunked) uploads (slower, but proxy friendly)\n"
+        << L"  --unlim                  Unlimited upload size (more than 1 Gb)\n"
         << L"  -s, --ssl                Enable HTTPS mode\n"
         << L"  -c, --cert CERT_PATH     Path to SSL certificate file (required for --ssl)\n"
         << L"  -k, --key KEY_PATH       Path to SSL private key file (required for --ssl)\n";
@@ -476,6 +529,8 @@ void print_usage(const char* progname) {
         << "  -p, --port PORT          Set the port (default: 80 for HTTP, 443 for HTTPS)\n"
         << "  -i, --index DIR_PATH     Serve static files from a directory. `index.html` is the default page.\n"
         << "  --pass PASSWORD          Enable HTTP Basic authentication (username is 'admin')\n"
+        << "  --proxy                  Use proxy-safe (chunked) uploads (slower, but proxy friendly)\n"
+        << "  --unlim                  Unlimited upload size (more than 1 Gb)\n"
         << "  -s, --ssl                Enable HTTPS mode\n"
         << "  -c, --cert CERT_PATH     Path to SSL certificate file (required for --ssl)\n"
         << "  -k, --key KEY_PATH       Path to SSL private key file (required for --ssl)\n";
@@ -505,11 +560,69 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
         res.set_content("No file uploaded", "text/plain");
         return;
     }
-    if (file.content.size() > MAX_UPLOAD_SIZE) {
+
+    // Proxy uploads can be slow/fragile; support chunked uploads where the browser
+    // sends many small multipart requests and we append them server-side.
+    const bool is_chunked_upload =
+        req.has_param("upload_id") &&
+        req.has_param("chunk_index") &&
+        req.has_param("total_chunks") &&
+        req.has_param("offset") &&
+        req.has_param("file_size");
+
+    if (!g_unlimited_upload && !is_chunked_upload && file.content.size() > MAX_UPLOAD_SIZE) {
         res.status = 413;
         res.set_content("Uploaded file is too large", "text/plain");
         return;
     }
+
+    std::size_t declared_file_size = 0;
+    std::size_t chunk_index = 0;
+    std::size_t total_chunks = 0;
+    std::size_t offset = 0;
+    std::string upload_id;
+    if (is_chunked_upload) {
+        try {
+            upload_id = req.get_param_value("upload_id");
+            chunk_index = static_cast<std::size_t>(std::stoull(req.get_param_value("chunk_index")));
+            total_chunks = static_cast<std::size_t>(std::stoull(req.get_param_value("total_chunks")));
+            offset = static_cast<std::size_t>(std::stoull(req.get_param_value("offset")));
+            declared_file_size = static_cast<std::size_t>(std::stoull(req.get_param_value("file_size")));
+        }
+        catch (...) {
+            res.status = 400;
+            res.set_content("Invalid chunk parameters", "text/plain");
+            return;
+        }
+
+        if (upload_id.empty() || upload_id.size() > 64 ||
+            std::any_of(upload_id.begin(), upload_id.end(), [](unsigned char c) {
+                return !(std::isalnum(c) || c == '_' || c == '-');
+                })) {
+            res.status = 400;
+            res.set_content("Invalid upload_id", "text/plain");
+            return;
+        }
+
+        if (!g_unlimited_upload && declared_file_size > MAX_UPLOAD_SIZE) {
+            res.status = 413;
+            res.set_content("Uploaded file is too large", "text/plain");
+            return;
+        }
+
+        if (total_chunks == 0 || chunk_index >= total_chunks) {
+            res.status = 400;
+            res.set_content("Invalid chunk range", "text/plain");
+            return;
+        }
+
+        if (offset > declared_file_size) {
+            res.status = 400;
+            res.set_content("Invalid offset", "text/plain");
+            return;
+        }
+    }
+
     std::string safeFilename = fs::path(file.filename).filename().string();
     if (safeFilename.empty()) {
         res.status = 400;
@@ -532,7 +645,7 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
 
 
     if (canonical_target_dir.string().rfind(canonical_root.string(), 0) != 0) {
-        res.status = 403; 
+        res.status = 403;
         res.set_content("Forbidden: Invalid target directory.", "text/plain");
         return;
     }
@@ -543,6 +656,99 @@ void upload_handler(const httplib::Request& req, httplib::Response& res) {
     if (fs::exists(fullPath)) {
         res.status = 409; // Conflict
         res.set_content("File with this name already exists", "text/plain");
+        return;
+    }
+
+    if (is_chunked_upload) {
+        static std::mutex chunk_write_mutex;
+
+        // Write chunks to a temporary file and rename on completion.
+        fs::path partPath = fullPath;
+        partPath += "." + upload_id + ".part";
+
+        // Ensure parent directories exist (same safety check as the non-chunked path).
+        if (fullPath.parent_path().string().rfind(canonical_root.string(), 0) != 0) {
+            res.status = 403;
+            res.set_content("Forbidden: Cannot create directory in this location.", "text/plain");
+            return;
+        }
+        fs::create_directories(fullPath.parent_path());
+
+        {
+            std::lock_guard<std::mutex> lock(chunk_write_mutex);
+
+            // Enforce in-order chunks: current part file size must match declared offset.
+            std::error_code ec;
+            const bool part_exists = fs::exists(partPath, ec);
+            const std::uintmax_t current_size = part_exists ? fs::file_size(partPath, ec) : 0;
+            if (ec) {
+                res.status = 500;
+                res.set_content("Failed to query upload state", "text/plain");
+                return;
+            }
+
+            if (chunk_index == 0) {
+                if (offset != 0) {
+                    res.status = 400;
+                    res.set_content("Invalid offset for first chunk", "text/plain");
+                    return;
+                }
+            }
+            else {
+                if (!part_exists) {
+                    res.status = 409;
+                    res.set_content("Missing initial chunk", "text/plain");
+                    return;
+                }
+            }
+
+            if (static_cast<std::uintmax_t>(offset) != current_size) {
+                res.status = 409;
+                res.set_content("Unexpected chunk offset", "text/plain");
+                return;
+            }
+
+            std::ios::openmode mode = std::ios::binary;
+            mode |= (chunk_index == 0) ? std::ios::trunc : std::ios::app;
+
+            std::ofstream ofs(partPath, mode);
+            if (!ofs) {
+                res.status = 500;
+                res.set_content("Failed to save chunk", "text/plain");
+                return;
+            }
+
+            ofs.write(file.content.data(), static_cast<std::streamsize>(file.content.size()));
+            if (!ofs) {
+                res.status = 500;
+                res.set_content("Failed to write chunk", "text/plain");
+                return;
+            }
+            ofs.close();
+
+            if (chunk_index + 1 == total_chunks) {
+                // Best-effort sanity check: final size should match declared file size.
+                std::error_code ec2;
+                const auto final_part_size = fs::file_size(partPath, ec2);
+                if (!ec2 && final_part_size != declared_file_size) {
+                    res.status = 500;
+                    res.set_content("Final size mismatch", "text/plain");
+                    return;
+                }
+
+                std::error_code ec3;
+                fs::rename(partPath, fullPath, ec3);
+                if (ec3) {
+                    res.status = (fs::exists(fullPath) ? 409 : 500);
+                    res.set_content("Failed to finalize upload", "text/plain");
+                    return;
+                }
+                res.set_content("File uploaded successfully", "text/plain");
+                return;
+            }
+        }
+
+        res.set_content("Chunk uploaded", "text/plain");
         return;
     }
 
@@ -575,6 +781,7 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
     if (!authenticate(req, res)) return;
 
     std::string dir = req.matches[1];
+    dir = url_decode(dir);
     if (dir.empty()) dir = ".";
 
     fs::path reqPath(dir);
@@ -668,68 +875,175 @@ void browse_handler(const httplib::Request& req, httplib::Response& res) {
     if (dir != ".") {
         fs::path currentPath = fs::u8path(dir);
         fs::path parent = currentPath.parent_path();
+
         std::string parent_str = parent.empty() ? "." : parent.u8string();
-        std::string parent_link = (parent_str == ".") ? "/" : ("/" + parent_str);
+        std::string parent_link = (parent_str == ".") ? "/" : ("/" + url_encode_path(parent_str));
         html << "      <li><a href='" << parent_link << u8"'>.. [↩ parent] </a></li>\n";
     }
 
     std::vector<std::pair<std::string, fs::path>> directories, files;
-    for (const auto& entry : fs::directory_iterator(fs_path)) {
-        std::string name = entry.path().filename().u8string();
-        if (fs::is_directory(entry.path())) directories.push_back({ name, entry.path() });
-        else if (fs::is_regular_file(entry.path())) files.push_back({ name, entry.path() });
+    try {
+        for (const auto& entry : fs::directory_iterator(fs_path)) {
+            std::string name = entry.path().filename().u8string();
+            if (fs::is_directory(entry.path())) directories.push_back({ name, entry.path() });
+            else if (fs::is_regular_file(entry.path())) files.push_back({ name, entry.path() });
+        }
+    }
+    catch (...) {
+        res.status = 403;
+        res.set_content("Access denied", "text/plain");
+        return;
     }
     std::sort(directories.begin(), directories.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
     std::sort(files.begin(), files.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
-    for (const auto& p : directories) html << u8"      <li>📁 <a href='/" << ((dir == ".") ? "" : dir + "/") << p.first << "'>" << p.first << "/</a></li>\n";
-    for (const auto& p : files) html << u8"      <li>🗎 <a href='/" << ((dir == ".") ? "" : dir + "/") << p.first << "'>" << p.first << "</a></li>\n";
+    const std::string base_href = (dir == ".") ? "" : (url_encode_path(dir) + "/");
+    for (const auto& p : directories) html << u8"      <li>📁 <a href='/" << base_href << url_encode(p.first) << "'>" << p.first << "/</a></li>\n";
+    for (const auto& p : files) html << u8"      <li>🗎 <a href='/" << base_href << url_encode(p.first) << "'>" << p.first << "</a></li>\n";
     html << "    </ul>\n"
         << "    <div class='footer'>Version " << VERSION << "</div>\n"
         << "  </div>\n"
-        << "  <script>\n"
-        << "    document.getElementById('uploadForm').addEventListener('submit', function(event) {\n"
-        << "      event.preventDefault();\n"
-        << "      var fileInput = document.querySelector('input[type=\"file\"]');\n"
-        << "      if (!fileInput.files.length) { alert('Please select a file.'); return; }\n"
-        << "      var formData = new FormData(); formData.append('file', fileInput.files[0]);\n"
-        << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
-        << "      xhr.upload.addEventListener('progress', function(e) {\n"
-        << "        if (e.lengthComputable) {\n"
-        << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
-        << "          document.getElementById('uploadProgress').value = percentComplete;\n"
-        << "        }\n"
-        << "      });\n"
-        << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
-        << "      xhr.onloadend = function() {\n"
-        << "        document.getElementById('uploadProgress').style.display = 'none';\n"
-        << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
-        << "        else { alert('Upload failed.'); }\n"
-        << "      };\n"
-        << "      xhr.send(formData);\n"
-        << "    });\n"
-        << "    var dropZone = document.getElementById('dropZone');\n"
-        << "    dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.style.backgroundColor = '#e0e0e0'; });\n"
-        << "    dropZone.addEventListener('dragleave', function(e) { e.preventDefault(); dropZone.style.backgroundColor = ''; });\n"
-        << "    dropZone.addEventListener('drop', function(e) {\n"
-        << "      e.preventDefault(); dropZone.style.backgroundColor = '';\n"
-        << "      var files = e.dataTransfer.files; if (files.length === 0) return;\n"
-        << "      var formData = new FormData(); formData.append('file', files[0]);\n"
-        << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
-        << "      xhr.upload.addEventListener('progress', function(e) {\n"
-        << "        if (e.lengthComputable) {\n"
-        << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
-        << "          document.getElementById('uploadProgress').value = percentComplete;\n"
-        << "        }\n"
-        << "      });\n"
-        << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
-        << "      xhr.onloadend = function() {\n"
-        << "        document.getElementById('uploadProgress').style.display = 'none';\n"
-        << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
-        << "        else { alert('Upload failed.'); }\n"
-        << "      };\n"
-        << "      xhr.send(formData);\n"
-        << "    });\n"
-        << "  </script>\n"
+        << "  <script>\n";
+
+    if (!g_proxy_upload_mode) {
+        // Old upload behavior: one POST request for the entire file.
+        html
+            << "    document.getElementById('uploadForm').addEventListener('submit', function(event) {\n"
+            << "      event.preventDefault();\n"
+            << "      var fileInput = document.querySelector('input[type=\"file\"]');\n"
+            << "      if (!fileInput.files.length) { alert('Please select a file.'); return; }\n"
+            << "      var formData = new FormData(); formData.append('file', fileInput.files[0]);\n"
+            << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
+            << "      xhr.upload.addEventListener('progress', function(e) {\n"
+            << "        if (e.lengthComputable) {\n"
+            << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
+            << "          document.getElementById('uploadProgress').value = percentComplete;\n"
+            << "        }\n"
+            << "      });\n"
+            << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
+            << "      xhr.onloadend = function() {\n"
+            << "        document.getElementById('uploadProgress').style.display = 'none';\n"
+            << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
+            << "        else { alert('Upload failed.'); }\n"
+            << "      };\n"
+            << "      xhr.send(formData);\n"
+            << "    });\n"
+            << "    var dropZone = document.getElementById('dropZone');\n"
+            << "    dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.style.backgroundColor = '#e0e0e0'; });\n"
+            << "    dropZone.addEventListener('dragleave', function(e) { e.preventDefault(); dropZone.style.backgroundColor = ''; });\n"
+            << "    dropZone.addEventListener('drop', function(e) {\n"
+            << "      e.preventDefault(); dropZone.style.backgroundColor = '';\n"
+            << "      var files = e.dataTransfer.files; if (files.length === 0) return;\n"
+            << "      var formData = new FormData(); formData.append('file', files[0]);\n"
+            << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
+            << "      xhr.upload.addEventListener('progress', function(e) {\n"
+            << "        if (e.lengthComputable) {\n"
+            << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
+            << "          document.getElementById('uploadProgress').value = percentComplete;\n"
+            << "        }\n"
+            << "      });\n"
+            << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
+            << "      xhr.onloadend = function() {\n"
+            << "        document.getElementById('uploadProgress').style.display = 'none';\n"
+            << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
+            << "        else { alert('Upload failed.'); }\n"
+            << "      };\n"
+            << "      xhr.send(formData);\n"
+            << "    });\n";
+    }
+    else {
+        // Proxy-safe upload behavior: small files use single POST, large files are chunked.
+        html
+            << "    function uploadSingle(file) {\n"
+            << "      var formData = new FormData(); formData.append('file', file);\n"
+            << "      var xhr = new XMLHttpRequest(); xhr.open('POST', document.getElementById('uploadForm').action, true);\n"
+            << "      xhr.upload.addEventListener('progress', function(e) {\n"
+            << "        if (e.lengthComputable) {\n"
+            << "          var percentComplete = Math.round((e.loaded / e.total) * 100);\n"
+            << "          document.getElementById('uploadProgress').value = percentComplete;\n"
+            << "        }\n"
+            << "      });\n"
+            << "      xhr.onloadstart = function() { document.getElementById('uploadProgress').style.display = 'block'; };\n"
+            << "      xhr.onloadend = function() {\n"
+            << "        document.getElementById('uploadProgress').style.display = 'none';\n"
+            << "        if (xhr.status === 200) { alert('Upload complete!'); window.location.reload(); }\n"
+            << "        else { alert('Upload failed.'); }\n"
+            << "      };\n"
+            << "      xhr.send(formData);\n"
+            << "    }\n"
+            << "    function uploadChunked(file) {\n"
+            << "      var chunkSize = 128 * 1024; // 128 KiB\n"
+            << "      var totalChunks = Math.ceil(file.size / chunkSize);\n"
+            << "      var uploadId = Date.now().toString(36) + Math.random().toString(36).slice(2);\n"
+            << "      var baseUrl = document.getElementById('uploadForm').action;\n"
+            << "      var progressEl = document.getElementById('uploadProgress');\n"
+            << "      progressEl.value = 0;\n"
+            << "      progressEl.style.display = 'block';\n"
+            << "      var maxRetries = 5;\n"
+            << "      function sendChunk(i, attempt) {\n"
+            << "        var start = i * chunkSize;\n"
+            << "        var end = Math.min(start + chunkSize, file.size);\n"
+            << "        var blob = file.slice(start, end);\n"
+            << "        var url = baseUrl + (baseUrl.indexOf('?') >= 0 ? '&' : '?') +\n"
+            << "          'upload_id=' + encodeURIComponent(uploadId) +\n"
+            << "          '&chunk_index=' + encodeURIComponent(String(i)) +\n"
+            << "          '&total_chunks=' + encodeURIComponent(String(totalChunks)) +\n"
+            << "          '&offset=' + encodeURIComponent(String(start)) +\n"
+            << "          '&file_size=' + encodeURIComponent(String(file.size));\n"
+            << "        var formData = new FormData();\n"
+            << "        formData.append('file', blob, file.name);\n"
+            << "        var xhr = new XMLHttpRequest(); xhr.open('POST', url, true);\n"
+            << "        xhr.upload.addEventListener('progress', function(e) {\n"
+            << "          if (e.lengthComputable) {\n"
+            << "            var loaded = start + e.loaded;\n"
+            << "            var percentComplete = Math.round((loaded / file.size) * 100);\n"
+            << "            progressEl.value = percentComplete;\n"
+            << "          }\n"
+            << "        });\n"
+            << "        xhr.onload = function() {\n"
+            << "          if (xhr.status === 200) {\n"
+            << "            if (i + 1 < totalChunks) { sendChunk(i + 1, 0); }\n"
+            << "            else { progressEl.style.display = 'none'; alert('Upload complete!'); window.location.reload(); }\n"
+            << "          } else {\n"
+            << "            if (attempt < maxRetries) {\n"
+            << "              setTimeout(function(){ sendChunk(i, attempt + 1); }, 500 * (attempt + 1));\n"
+            << "            } else {\n"
+            << "              progressEl.style.display = 'none'; alert('Upload failed.');\n"
+            << "            }\n"
+            << "          }\n"
+            << "        };\n"
+            << "        xhr.onerror = function() {\n"
+            << "          if (attempt < maxRetries) {\n"
+            << "            setTimeout(function(){ sendChunk(i, attempt + 1); }, 500 * (attempt + 1));\n"
+            << "          } else {\n"
+            << "            progressEl.style.display = 'none'; alert('Upload failed.');\n"
+            << "          }\n"
+            << "        };\n"
+            << "        xhr.send(formData);\n"
+            << "      }\n"
+            << "      sendChunk(0, 0);\n"
+            << "    }\n"
+            << "    function startUpload(file) {\n"
+            << "      var CHUNK_THRESHOLD = 300 * 1024; // 300 KB\n"
+            << "      if (file.size > CHUNK_THRESHOLD) uploadChunked(file);\n"
+            << "      else uploadSingle(file);\n"
+            << "    }\n"
+            << "    document.getElementById('uploadForm').addEventListener('submit', function(event) {\n"
+            << "      event.preventDefault();\n"
+            << "      var fileInput = document.querySelector('input[type=\"file\"]');\n"
+            << "      if (!fileInput.files.length) { alert('Please select a file.'); return; }\n"
+            << "      startUpload(fileInput.files[0]);\n"
+            << "    });\n"
+            << "    var dropZone = document.getElementById('dropZone');\n"
+            << "    dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.style.backgroundColor = '#e0e0e0'; });\n"
+            << "    dropZone.addEventListener('dragleave', function(e) { e.preventDefault(); dropZone.style.backgroundColor = ''; });\n"
+            << "    dropZone.addEventListener('drop', function(e) {\n"
+            << "      e.preventDefault(); dropZone.style.backgroundColor = '';\n"
+            << "      var files = e.dataTransfer.files; if (files.length === 0) return;\n"
+            << "      startUpload(files[0]);\n"
+            << "    });\n";
+    }
+
+    html << "  </script>\n"
         << "</body>\n"
         << "</html>";
     res.set_content(html.str(), "text/html; charset=utf-8");
@@ -818,6 +1132,8 @@ int main(int argc, char* argv[]) {
         if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return 0; }
         else if ((arg == "-p" || arg == "--port") && i + 1 < argc) { try { port = std::stoi(argv[++i]); port_is_default = false; } catch (...) { std::cerr << "Invalid port value.\n"; return 1; } }
         else if (arg == "--pass" && i + 1 < argc) { auth_password = argv[++i]; require_auth = true; }
+        else if (arg == "--proxy") { g_proxy_upload_mode = true; }
+        else if (arg == "--unlim") { g_unlimited_upload = true; }
         else if (arg == "-s" || arg == "--ssl") { use_ssl = true; }
         else if ((arg == "-c" || arg == "--cert") && i + 1 < argc) { cert_path = argv[++i]; }
         else if ((arg == "-k" || arg == "--key") && i + 1 < argc) { key_path = argv[++i]; }
@@ -904,7 +1220,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    svr->set_payload_max_length(MAX_UPLOAD_SIZE);
+    if (g_unlimited_upload) {
+        svr->set_payload_max_length((std::numeric_limits<std::size_t>::max)());
+    }
+    else {
+        svr->set_payload_max_length(MAX_UPLOAD_SIZE);
+    }
 
     if (!g_web_root_path.empty()) {
         svr->Get(R"(/(.*))", serve_static_content_handler);
